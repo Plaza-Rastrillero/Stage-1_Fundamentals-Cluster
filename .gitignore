@@ -1,0 +1,4 @@
+SEC cache/
+output/*.csv
+__pycache__/
+*.pyc
