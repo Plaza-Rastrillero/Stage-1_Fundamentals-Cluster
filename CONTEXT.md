@@ -38,28 +38,61 @@ $env:SEC_USER_AGENT = "Your Name your.email@example.com"   # EDGAR 403s without 
 
 python bscf.py MSFT AAPL TSM        # detail mode: full labeled breakdown per ticker
 python bscf.py --date 2026-09-15    # screen mode: whole earnings day, ranked table + CSV
+python bscf.py MSFT --html          # detail mode, and a self-contained HTML page
 ```
 
 Useful flags: `--refresh` (bypass cache), `--limit N`, `--min-cap`,
 `--drop-doubtful`.
+
+`--html [PATH]` is a second output target for detail mode, not a replacement:
+the run prints the terminal breakdown **and** writes the page, so the two can be
+diffed against each other. PATH is optional and defaults into `output/`. Screen
+mode stays terminal-only; `--date --html` prints a note and writes nothing.
 
 ## Folder layout
 
 ```
 bscf.py        the only file you run — CLI and mode switching
 bscflib/
-  report.py    >>> ALL DISPLAY CODE IS HERE <<<
+  report.py       >>> TERMINAL DISPLAY CODE <<<
+  html_report.py  >>> HTML DISPLAY CODE <<<
   tags.py      XBRL tag ladders (data only)
   formula.py   net assets, total debt, doubt gate, trend
   resolve.py   tags -> numbers
   sec_client.py / sec_cache.py / earnings_calendar.py
-output/        CSVs from --date runs
+output/        CSVs from --date runs, HTML pages from --html (both gitignored)
 SEC cache/     downloaded SEC data, safe to delete (if renamed, update
                CACHE_DIR in bscflib/sec_cache.py to match)
-archive (storage)/   retired screener, imported by nothing
+archive (storage)/   retired screeners, imported by nothing — see below
 ```
 
-**For display work, edit `bscflib/report.py` and nothing else.** Its surface:
+The folder names above are the real ones on disk. A rename to `cache/` and
+`archive/` has been floated but not carried out; doing it means moving the
+folders **and** updating `CACHE_DIR` in `bscflib/sec_cache.py` in the same
+change, or the next run silently re-downloads everything into a fresh folder
+under the old name.
+
+### What is in `archive (storage)/`
+
+Two retired copies of the original monolithic screener. They are **not**
+duplicates of each other and neither is a superset:
+
+| file | has | lacks |
+|---|---|---|
+| `Stage1-BSCF.py` | the doubt gate that became `formula.py` | coverage ratios |
+| `Stage1-BSCF-with-coverage-ratios.py` | `debt_coverage`, `interest_expense`, and the year-to-date differencing quarterizer for TTM windows | the doubt gate |
+
+The coverage machinery in the second file exists nowhere else in the repository
+and in no earlier commit. It is the reference implementation if leverage and the
+coverage ratios are ever added back (see **Deliberately absent** below), so it is
+kept deliberately rather than by accident.
+
+**For display work, edit `bscflib/report.py` or `bscflib/html_report.py` and
+nothing else.**
+
+### `report.py` — terminal
+
+Its surface:
 
 | function | role |
 |---|---|
@@ -76,6 +109,55 @@ archive (storage)/   retired screener, imported by nothing
 | `write_csv(results, path)` | full record incl. things the tables omit |
 
 Module constants: `WIDTH = 78`, `MILLIONS`, `STALE_AFTER_DAYS = 180`.
+
+### `html_report.py` — a self-contained page
+
+One `.html` file with the CSS and JS inlined. No build step, no server, no CDN,
+no network at open time — it works from `file://`. Vanilla everything.
+
+| function | role |
+|---|---|
+| `page(results, title=None)` | the whole document, one card per company |
+| `card(result)` | one company as a self-contained `<article>` |
+| `write(results, path)` | `page()` on disk |
+| `suggest_path(results, dir)` | default `output/bscf_<tickers>_<stamp>.html` |
+| `compact(value, unit)` | `$72.9B` — the glanceable form, never the only form |
+| `band(result)` | which verdict band a reading falls in |
+| `_verdict` / `_beam` / `_ledger` | the three parts of a card body |
+| `_excluded` / `_sweep` / `_overlap` | the caveat panels |
+| `_sparkline(result, accent)` | the trend, as hand-written inline SVG |
+| `_tag_chip(namespace, tag)` | one XBRL tag, visible and copy-on-click |
+
+`page()` takes a **list** at every size. One company is a one-card page; with two
+or more an index rail appears above the cards. That is the seam a ranked
+multi-company view grows from — no rewrite needed.
+
+`money`, `ratio`, `flags`, `LABELS` and `STALE_AFTER_DAYS` are imported from
+`report.py` rather than reimplemented, so the terminal and the page cannot drift
+apart on what a number looks like.
+
+**The `CONFIG` block at the top of the module owns every threshold and colour**
+— `BANDS` (five verdict bands, read on `norm` so they mean the same thing for a
+$5bn company and a $3tn one), `DOUBT_NOTICE` / `DOUBT_ALARM` /
+`DOUBT_METER_FULL`, `AGE_WARN` / `AGE_ALARM`, `NORM_SCALE`, `TREND_FLAT`, and
+`PALETTE`. Nothing emphasised or coloured is set anywhere else; these are meant
+to be tuned. The block is also serialized into every page as
+`<script type="application/json" id="bscf-config">`, so a saved file explains
+the thresholds it was drawn with.
+
+How the five formatting rules survive the medium:
+
+1. the tag is printed under each figure, not hidden behind a hover — a
+   screenshot has to stay diagnosable
+2. one CSS grid track sized to the widest cell gives the same shared
+   right-aligned money column the fixed-width terminal column does
+3. an absent figure still prints its reason (`not reported`, `EXCLUDED` with the
+   date and amount alongside), never a bare zero
+4. a derived figure's bracket note renders as an amber pill, a visibly
+   different shape from a grey tag chip, so provenance is never read as
+   derivation
+5. flags ride the ticker and carry their meaning next to them, with the legend
+   kept at the foot as a reminder rather than a lookup
 
 `tags.py` / `resolve.py` / `formula.py` are the correctness core — changing them
 changes the numbers, not the presentation.
@@ -203,21 +285,33 @@ current/non-current debt.
 
 ---
 
-## Known display rough edges — candidates for the redesign
+## Known display rough edges
+
+These all describe the **terminal** renderer. `--html` was built partly to
+dissolve them rather than patch them; where it does, that is noted.
 
 1. **Redundant column.** The summary's last column (`Net Cash` / `Net Debt`) is
    unheaded and says the same thing as the sign on `RESULT`.
 2. **Source lines run arbitrarily long.** A three-component IFRS sum plus its
    bracket note is ~250 characters and blows past any terminal width. No
    wrapping or truncation strategy exists.
+   *Gone in HTML:* each tag is its own chip on a row that spans the grid, so
+   TSM's three-tag sums wrap instead of running off the end. Verified on TSM.
 3. **Two different rulers.** `render()` uses a fixed `WIDTH = 78` for its rules,
    while `summary()` and `screen()` compute their own width from content, so the
    separators in one run don't line up with each other.
 4. **Dangling separator.** A company with no excluded lines and no sweep hits
    ends its block on a trailing `---` rule with nothing under it.
+   *Gone in HTML:* sections are elements that either exist or don't, so there is
+   no rule to leave hanging. Verified on MSFT and TSM.
 5. **Non-USD money columns aren't comparable** across rows. Screen mode dodges
    this by ranking on `norm`; detail mode just prints the currency code.
+   *Unchanged in HTML, deliberately:* the currency is printed, the chip is
+   highlighted and the card says "figures as filed in TWD - not converted".
+   Nothing is converted, because the data does not support the comparison.
 6. **The sweep note is four lines of prose** inside an otherwise tabular block.
+   *Gone in HTML:* it is a collapsed `<details>` on the caveat panel — present
+   and discoverable, not shouting.
 
 ## Deliberately absent
 
@@ -226,7 +320,13 @@ request** and may be added back later as a separate piece of work. Operating
 cash flow and interest expense went with them, since all three read XBRL
 *duration* facts and shared the same machinery (a year-to-date differencing
 quarterizer for TTM windows). If they return, the display needs a row for
-EBITDA with its period, a leverage row, and a `#` flag for "EBITDA unavailable".
+EBITDA with its period, a leverage row, and a `#` flag for "EBITDA unavailable"
+— in both renderers now, and in `html_report.py` a band for leverage would go in
+the `CONFIG` block with the rest.
+
+The quarterizer and the `debt_coverage` / `interest_coverage` implementations
+survive only in `archive (storage)/Stage1-BSCF-with-coverage-ratios.py`. Read
+that before rebuilding any of it from scratch.
 
 ## How the user likes to work
 
@@ -234,5 +334,18 @@ EBITDA with its period, a leverage row, and a `#` flag for "EBITDA unavailable".
   for an explicit go-ahead ("build it", "do your recommended changes").
 - **Verify against real data before stating a number.** SEC data is cheap to
   query; run the check, then state the figure. Label estimates as estimates.
+- **Never run a git command that changes state without being told to, every
+  time.** Reading git state is fine. Branching, staging, committing, pushing:
+  only on an explicit instruction, and confirm the scope first. An unrequested
+  commit rewrites the user's own record of the work.
+- **Every commit carries an updated `CONTEXT.md`.** This file is the memory that
+  travels with the code, and keeping it current is the assistant's job, at its
+  discretion. Before committing, re-read it and fix whatever the change made
+  stale — layout, module surface, flags, rough edges, this list. Stage it in the
+  same commit, never a follow-up. Correct inaccuracies even where a human wrote
+  them, and say so in the report rather than silently.
+- **If an instruction rests on a premise that turns out to be false, stop and
+  say so** instead of executing it. "Delete it if it's the same file" is not
+  authorization to delete when the files differ.
 - The user is new to Python but not new to the domain — pitch explanations of
   Python mechanics plainly, and financial/XBRL reasoning at expert level.
