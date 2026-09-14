@@ -42,7 +42,13 @@ import argparse  # noqa: E402
 import os  # noqa: E402
 from datetime import datetime  # noqa: E402
 
-from bscflib import earnings_calendar, formula, report, sec_client  # noqa: E402
+from bscflib import (  # noqa: E402
+    earnings_calendar,
+    formula,
+    html_report,
+    report,
+    sec_client,
+)
 
 MIN_MARKET_CAP = 300_000_000
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -115,6 +121,9 @@ def main() -> int:
                         help="ignore cached SEC data and re-fetch")
     parser.add_argument("--drop-doubtful", action="store_true",
                         help="exclude rows whose unclassified pool outweighs the signal")
+    parser.add_argument("--html", nargs="?", const="", metavar="PATH",
+                        help="also write a self-contained HTML page of the detail "
+                             "breakdown; PATH is optional and defaults into output/")
     args = parser.parse_args()
 
     if not sec_client.SEC_USER_AGENT:
@@ -172,6 +181,12 @@ def main() -> int:
             print("\n".join(report.render(result, column)))
             print()
         print("\n".join(report.summary(results)))
+        # Printed as well as written, never instead: the two renderings are
+        # meant to agree figure for figure, and one run showing both is what
+        # makes that checkable.
+        if args.html is not None:
+            path = args.html or html_report.suggest_path(results, OUTPUT_DIR)
+            print(f"\nWrote {html_report.write(results, path)}")
     else:
         print("\n".join(report.screen(results, target)))
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -179,6 +194,9 @@ def main() -> int:
         path = os.path.join(OUTPUT_DIR, f"bscf_{target.isoformat()}_{stamp}.csv")
         report.write_csv(results, path)
         print(f"\nWrote {path}")
+        if args.html is not None:
+            print("\n--html covers the detail breakdown only; the screen table "
+                  "stays in the terminal.")
 
     if skipped:
         print_skipped(skipped)
