@@ -23,6 +23,9 @@ Folder layout:
                      sec_client.py / sec_cache.py / earnings_calendar.py
                                  fetching and caching
     output/        the CSVs a --date run writes
+    calendar/      raw Nasdaq calendar rows, archived by every --date run.
+                   NOT safe to delete: Nasdaq drops the before-open/after-close
+                   field once a date has passed, so these cannot be re-fetched.
     SEC cache/     downloaded SEC data. Safe to delete at any time; the next run
                    re-fetches. Use --refresh to bypass it for one run. If you
                    rename it, update CACHE_DIR in bscflib/sec_cache.py to match.
@@ -46,6 +49,10 @@ from bscflib import earnings_calendar, formula, report, sec_client  # noqa: E402
 
 MIN_MARKET_CAP = 300_000_000
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+# Gitignored like output/ and SEC cache/, but unlike them NOT regenerable:
+# everything else this tool writes can be produced again from the sources,
+# these files cannot. Git is not their backup - copy them out of the repo.
+CALENDAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar")
 
 
 def collect(
@@ -137,15 +144,41 @@ def main() -> int:
         print(f"Fetching Nasdaq earnings calendar for {target}...")
         rows = earnings_calendar.fetch(target)
         print(f"  {len(rows)} ticker(s) reporting.")
+        # Silent while the format holds. The first run that prints this is the
+        # run where Nasdaq changed something under us, which is the only
+        # warning this endpoint will ever give.
+        unrecognised = [r for r in rows if r.market_cap_raw is not None]
+        if unrecognised:
+            sample = ", ".join(f'{r.symbol} "{r.market_cap_raw}"'
+                               for r in unrecognised[:3])
+            print(f"  WARNING: {len(unrecognised)} market cap value(s) in an "
+                  f"unrecognised format ({sample}).")
+            print("           Treated as unknown and kept - --min-cap did not "
+                  "filter them.")
         if args.min_cap > 0:
             # Unknown cap is kept: missing calendar metadata is not evidence of
             # a small company, and the SEC data will speak for itself.
-            tickers = [t for t, cap in rows if cap is None or cap >= args.min_cap]
+            tickers = [r.symbol for r in rows
+                       if r.market_cap is None or r.market_cap >= args.min_cap]
             print(f"  {len(rows) - len(tickers)} below "
                   f"${args.min_cap / report.MILLIONS:,.0f}M market cap, "
                   f"{len(tickers)} remain.")
         else:
-            tickers = [t for t, _ in rows]
+            tickers = [r.symbol for r in rows]
+        # Runs whatever date is under screen, because what it preserves is a
+        # property of now rather than of the target: Nasdaq wipes the
+        # before-open/after-close field once a date has passed, so a day not
+        # recorded before it happens cannot be recovered.
+        try:
+            captured = earnings_calendar.capture(CALENDAR_DIR)
+        except Exception as exc:  # noqa: BLE001 - the archive is never the point
+            print(f"  Calendar archive skipped - {type(exc).__name__}: {exc}")
+        else:
+            print(f"  Archived {captured.rows} calendar row(s) over "
+                  f"{captured.dates} upcoming date(s); {captured.timed} carry a "
+                  f"confirmed before-open/after-close slot.")
+            if captured.failures:
+                print(f"  {captured.failures} date(s) could not be archived.")
     if args.limit:
         tickers = tickers[: args.limit]
     if not tickers:

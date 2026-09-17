@@ -1,4 +1,10 @@
 SEC cache/
 output/*.csv
+output/*.html
 __pycache__/
 *.pyc
+
+# Raw Nasdaq calendar rows: out of version control because the pile grows
+# without bound, but NOT regenerable, unlike everything above it.
+# See CONTEXT.md 5.4 before deleting any of it.
+calendar/
