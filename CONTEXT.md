@@ -224,21 +224,22 @@ The record that travels between the two is `formula.Result`, a frozen
 dataclass. It is the one contract every renderer reads; add a field there and
 `report.CSV_COLUMNS` decides whether it reaches the CSV.
 
+**These entries do not list each module's functions.** That list is in the code,
+where it cannot go stale, and one command prints the whole surface accurately:
+
+```
+grep -n "^def \|^class " bscf.py bscflib/*.py
+```
+
+What is here instead is the part the code cannot tell you: why each module
+exists, what its rules are, and which of its decisions are load-bearing. When
+this file and the code disagree about a name, the code wins — but say so rather
+than quietly correcting it.
+
 ### 4.1 `bscf.py`
 
 *Role.* The only file you run. Argument parsing, mode switching, and the loop
 that turns a ticker list into results.
-
-| function / type | role |
-|---|---|
-| `Skip` | `ticker`, `reason` — one ticker that produced nothing |
-| `collect(tickers, refresh, verbose)` | ticker list -> `(results, skipped)` |
-| `print_skipped(skipped)` | splits "outside coverage by design" from "data problems worth a look" |
-| `calendar_tickers(target, min_cap)` | the day's calendar -> the ticker list |
-| `archive_calendar()` | preserves the perishable half of the calendar |
-| `render(results, target)` | whichever of the two output shapes the run calls for |
-| `build_parser()` | the flags |
-| `main()` | validation, mode switch, orchestration |
 
 *Constants.* `MIN_MARKET_CAP = 300_000_000`, `OUTPUT_DIR`, `CALENDAR_DIR`.
 
@@ -315,24 +316,6 @@ the rules that stop a figure being quietly wrong: one balance sheet date per
 company, the most recently filed value when several filings report that date,
 the right taxonomy for a foreign filer, and one currency throughout.
 
-| function / type | role |
-|---|---|
-| `Fact` | one observation: `end`, `val`, `filed` |
-| `Resolution` | frozen: `value`, `tags`, `notes`, `stale` |
-| `Resolution.resolved` | did a tag supply this figure **at the target date** |
-| `Resolution.with_note` / `.less` | a new Resolution, annotated / netted down |
-| `Basis` | `namespace`, `unit`, `as_of`, `filed`, `index` |
-| `Index` | `tag -> {date: Fact}` |
-| `parse_date(value)` | `"YYYY-MM-DD"` -> `date` |
-| `_instants(facts, ns, tag, unit=None)` | every instant observation for one tag |
-| `index_instants(facts, namespace, unit)` | build an `Index`, latest filing wins |
-| `parse_rung(rung)` | the two-operator rung syntax -> slots (cached) |
-| `_ladder_tags(ladder)` | every tag a ladder names, in order |
-| `resolve_instant(index, ns, field, as_of)` | walk one ladder at one date |
-| `anchor_dates(index, namespace)` | every balance sheet date published, oldest first |
-| `choose_basis(facts)` | `Basis`, or `None` |
-| `sweep_unclassified(...)` | balances in a category no ladder captured, largest first |
-
 *Worth knowing.*
 - **Latest filing wins.** Original filing, restatement, amendment and
   prior-period comparative all report the same period end; the most recently
@@ -367,18 +350,6 @@ the right taxonomy for a foreign filer, and one currency throughout.
 ### 4.4 `bscflib/formula.py`
 
 *Role.* The BSCF formula, and the checks that say whether to believe it.
-
-| function / type | role |
-|---|---|
-| `Result` | **the record every renderer reads** — frozen, flat, 24 fields |
-| `Snapshot` | the formula at one date |
-| `SweepBasis` | what the sweep must not count again (`counted`, `used`) |
-| `Reason` | `text`, `out_of_scope` — why a ticker produced no result |
-| `snapshot(index, namespace, as_of)` | `(Snapshot, SweepBasis)`, or `None` |
-| `_net_combined_debt(noncurrent, current)` | the combined-caption netting |
-| `_overlaps(lines)` | debt lines exceeding their own subtotal |
-| `_sweep(facts, basis, scaffold, gaps)` | both sides of the sweep |
-| `analyze(ticker, cik, refresh)` | `(Result, None)` or `(None, Reason)` |
 
 *Constants.*
 
@@ -429,15 +400,6 @@ answering without that being a SEC problem.
 **This module is the read path only.** The archive that preserves these rows is
 §4.6; the two share `fetch_raw` and nothing else.
 
-| function / type | role |
-|---|---|
-| `Row` | `symbol`, `market_cap`, `market_cap_raw`, `timing` |
-| `parse_market_cap(raw)` | `(value, unrecognised_text)` |
-| `parse_timing(raw)` | `"pre-market"` / `"after-hours"` / `""` |
-| `normalise_symbol(raw)` | the row's ticker, or `""` |
-| `fetch_raw(day)` | raw Nasdaq rows, verbatim |
-| `fetch(day)` | every company reporting on `day` |
-
 *Constants.* `CALENDAR_URL`, `TIMEOUT = 20`, `BROWSER_USER_AGENT`,
 `MARKET_CAP_PATTERN`, `TIMING`, `NOT_SUPPLIED`.
 
@@ -471,14 +433,6 @@ re-read. Split from `earnings_calendar` because it is the opposite kind of job:
 that module reads a list for the screen and forgets it, this one owns durable
 files with their own atomicity, merge and never-overwrite rules.
 
-| function / type | role |
-|---|---|
-| `Capture` | `dates`, `rows`, `timed`, `failures` |
-| `capture_path(directory, day)` | `calendar/<date>.json` |
-| `_merge(record, rows, observed)` | fold one observation into a day's archive |
-| `_archive_day(path, day, rows, observed)` | read, merge and write one day |
-| `capture(directory, start, days)` | archive the raw rows for a forward window |
-
 *Constants.* `CAPTURE_WINDOW_DAYS = 14`, `CAPTURE_INTERVAL = 0.3`.
 
 *Worth knowing.*
@@ -503,24 +457,6 @@ files with their own atomicity, merge and never-overwrite rules.
 ### 4.7 `bscflib/report.py` — terminal
 
 *Role.* The printed breakdown, the tables and the CSV.
-
-| function / type | role |
-|---|---|
-| `money(value, unit)` | `$1,234,567`, or `TWD 1,234,567` for non-USD filers |
-| `millions(value)` | scaled column for the wide screen table |
-| `ratio(value, places=3)` | the normalized result |
-| `calendar_warning(rows)` | the unrecognized-market-cap tripwire, as lines |
-| `flags(result)` | builds the `*` `~` `!` suffix on a ticker |
-| `_header` / `_ledger` / `_totals` | the three parts of a breakdown body |
-| `_excluded` / `_sweep` / `_overlap` | the caveat sections |
-| `render(result, column)` | the per-company breakdown block |
-| `column_width(results)` | shared money-column width across a run |
-| `Column` | one table column: `header`, `align`, `value` |
-| `_table(columns, results)` | generic fixed-width table builder |
-| `summary(results)` | compact table, detail mode |
-| `screen(results, target)` | wide table, screen mode |
-| `legend(results)` / `trend(...)` | footers |
-| `write_csv(results, path)` | full record incl. things the tables omit |
 
 *Constants.* `WIDTH = 78`, `MILLIONS`, `STALE_AFTER_DAYS = 180`, `LABELS`,
 `EXCLUDED_LINES`, `SECTIONS`, `SUMMARY_COLUMNS`, `SCREEN_COLUMNS`,
@@ -553,7 +489,8 @@ no CDN, no network at open time — it works from `file://`. Vanilla everything.
 > **Not on the `logic` branch.** This module lives on `display`. The entry below
 > describes it as built there; it has **not** been migrated to `formula.Result`
 > or to the `report.py` surface documented in §4.7, and will need both when the
-> branches meet.
+> branches meet. It keeps its function table — unlike every other entry here —
+> because the code is not on this branch to be read instead.
 
 | function | role |
 |---|---|
@@ -603,14 +540,6 @@ the thresholds it was drawn with.
 
 *Role.* Talking to SEC EDGAR: rate limiting, retries, and the ticker -> CIK map.
 
-| function | role |
-|---|---|
-| `sec_get(url)` | rate-limited, retried GET; `None` on a clean 404 |
-| `cached_sec_get(url, refresh)` | `sec_get` through `sec_cache` |
-| `fetch_ticker_cik_map(refresh)` | `{TICKER: cik}` from `company_tickers.json` |
-| `lookup_cik(ticker, cik_map)` | ticker -> CIK, reconciling share-class separators |
-| `fetch_company_facts(cik, refresh)` | the companyfacts payload |
-
 *Constants.* `SEC_USER_AGENT` (from the environment), `SEC_TICKER_MAP_URL`,
 `SEC_COMPANY_FACTS_URL`, `SEC_REQUEST_INTERVAL = 0.12`, `SEC_TIMEOUT = 60`,
 `SEC_MAX_RETRIES = 3`, `USER_AGENT_HELP`.
@@ -637,12 +566,6 @@ the thresholds it was drawn with.
 
 *Role.* On-disk cache for SEC responses.
 
-| function | role |
-|---|---|
-| `cache_path(url)` | SHA1-derived filename inside `CACHE_DIR` |
-| `load(url, refresh)` | cached payload, or `None` |
-| `store(url, payload)` | write one payload, atomically |
-
 *Constants.* `PROJECT_ROOT`, `CACHE_DIR = "<root>/SEC cache"`,
 `CACHE_TTL_HOURS = 24`.
 
@@ -662,10 +585,6 @@ the thresholds it was drawn with.
 ### 4.11 `bscflib/jsonio.py`
 
 *Role.* One atomic JSON write, shared by both on-disk writers.
-
-| function | role |
-|---|---|
-| `write_json_atomic(path, payload, **dump_kwargs)` | write via a temp file, then `os.replace` |
 
 *Worth knowing.*
 - The calendar archive needs this because its files cannot be re-fetched at any
