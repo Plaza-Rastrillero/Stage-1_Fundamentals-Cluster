@@ -184,30 +184,54 @@ SWEEP_LIABILITY_PATTERNS = (
 # available-for-sale debt security is something the company owns, not owes.
 SWEEP_LIABILITY_EXCLUDE = ("securit", "available", "investment", "receivable", "heldto")
 
-# Disclosure-note artifacts that restate a balance counted elsewhere: maturity
-# ladders, unrealized gain/loss tables, cost-basis alternates, rate disclosures.
+# What the sweep must never count. Grouped by the reason each entry is here -
+# the groups were already in the comments, they just were not in the data, so a
+# change could not target one reason without re-reading all of them.
+#
+# Matching is by substring, so an entry that contains another entry is dead
+# weight: "unrealized" can never fire while "realized" is present, and
+# "fairvaluedisclosure" can never fire while "fairvalue" is. Both were dropped.
+
+# Disclosure-note restatements of a balance counted elsewhere: maturity
+# ladders, gain/loss tables, cost-basis alternates, rate disclosures.
 # Including these would multiply the same pool several times over.
-SWEEP_EXCLUDE_PATTERNS = (
-    "maturit", "unrealized", "realized", "impairment", "pledged", "amortizedcost",
-    "fairvaluedisclosure", "fairvalue", "restricted", "continuous", "accumulated",
+_DISCLOSURE_ARTIFACTS = (
+    "maturit", "realized", "impairment", "pledged", "amortizedcost",
+    "fairvalue", "restricted", "continuous", "accumulated",
     "allowance", "creditloss", "weightedaverage", "interestrate", "proceeds",
     "repayments", "instrument", "unamortized", "unamortised", "covenant",
     "issuancecosts", "discount", "guarantee", "conversion", "redemption",
     "restructur", "extinguish", "arisingfrom", "effectivein",
-    # Current operating accruals: out of scope rather than missed.
+)
+
+# Current operating accruals, and combined captions that restate cash and
+# investments already counted: out of scope rather than missed.
+_NOT_IN_FORMULA = (
     "liabilitiescurrent",
-    # Combined captions that restate cash and investments already counted.
     "cashcashequivalentsand",
-    # For a REIT or a BDC "investment" is the operating business - buildings and
-    # loan books - not a liquid balance. Without these a property trust flags its
-    # whole balance sheet and buries the real findings.
+)
+
+# For a REIT or a BDC "investment" is the operating business - buildings and
+# loan books - not a liquid balance. Without these a property trust flags its
+# whole balance sheet and buries the real findings.
+_OPERATING_INVESTMENTS = (
     "realestateinvestment", "investmentproperty", "investmentbuilding",
     "investmentowned", "netinvestmentinlease", "financialinstrumentsowned",
     "taxbasisofinvestments", "derivative",
-    # Repo funding is a liability despite the "securities" in its name.
+)
+
+# Not a balance on the sheet: repo funding is a liability despite the
+# "securities" in its name, and a commitment is an undrawn future obligation.
+_NOT_A_BALANCE = (
     "soldunderagreements",
-    # Undrawn future obligations, not a balance on the sheet.
     "commitment",
+)
+
+SWEEP_EXCLUDE_PATTERNS = (
+    _DISCLOSURE_ARTIFACTS
+    + _NOT_IN_FORMULA
+    + _OPERATING_INVESTMENTS
+    + _NOT_A_BALANCE
 )
 
 SWEEP_DETAIL_TAGS = 4  # source tags reported per side

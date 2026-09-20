@@ -164,10 +164,13 @@ DESIGN_NOTES.md  the user's own notes on the code — read, don't rewrite
 bscflib/
   tags.py         XBRL tag ladders (data only)
   resolve.py      tags -> numbers
-  formula.py      net assets, total debt, doubt gate, trend
+  formula.py      net assets, total debt, doubt gate, trend; owns Result
   report.py       terminal display
-  html_report.py  HTML display
-  sec_client.py / sec_cache.py / earnings_calendar.py
+  html_report.py  HTML display (on the display branch only)
+  earnings_calendar.py  the Nasdaq calendar (read path)
+  calendar_archive.py   its archive (durable write path)
+  jsonio.py       one atomic JSON write, shared by both writers
+  sec_client.py / sec_cache.py
 output/        CSVs from --date runs, HTML pages from --html (both gitignored)
 calendar/      raw Nasdaq calendar rows, archived by every --date run.
                gitignored, but NOT safe to delete — see §5.4
@@ -217,16 +220,25 @@ them changes the numbers, not the presentation. `report.py` and
 `bscflib/html_report.py` and nothing else.** That rule is scoped to display
 work; it is not a general prohibition on the rest of the tree.
 
+The record that travels between the two is `formula.Result`, a frozen
+dataclass. It is the one contract every renderer reads; add a field there and
+`report.CSV_COLUMNS` decides whether it reaches the CSV.
+
 ### 4.1 `bscf.py`
 
 *Role.* The only file you run. Argument parsing, mode switching, and the loop
 that turns a ticker list into results.
 
-| function | role |
+| function / type | role |
 |---|---|
+| `Skip` | `ticker`, `reason` — one ticker that produced nothing |
 | `collect(tickers, refresh, verbose)` | ticker list -> `(results, skipped)` |
 | `print_skipped(skipped)` | splits "outside coverage by design" from "data problems worth a look" |
-| `main()` | flags, mode switch, output |
+| `calendar_tickers(target, min_cap)` | the day's calendar -> the ticker list |
+| `archive_calendar()` | preserves the perishable half of the calendar |
+| `render(results, target)` | whichever of the two output shapes the run calls for |
+| `build_parser()` | the flags |
+| `main()` | validation, mode switch, orchestration |
 
 *Constants.* `MIN_MARKET_CAP = 300_000_000`, `OUTPUT_DIR`, `CALENDAR_DIR`.
 
@@ -237,9 +249,15 @@ that turns a ticker list into results.
   the failure is recorded in `skipped`.
 - The calendar fetch is **not** wrapped, deliberately — no calendar means no
   ticker list, so there is no partial work to salvage.
+- `archive_calendar()` is **not** wrapped either, because
+  `calendar_archive.capture` never raises (§4.6). The guarantee lives in one
+  place rather than being asserted at both ends.
 - Share classes are de-duplicated **by CIK**, not by ticker: `DGICA`/`DGICB` are
   one filer with one balance sheet, and would otherwise rank twice.
 - Per-ticker progress prints only in screen mode (`verbose=target is not None`).
+- A skip carries a `formula.Reason`, which is `(text, out_of_scope)`. The
+  category used to be a magic prefix on the front of the text, matched with
+  `startswith` and sliced back off by the printer.
 
 ### 4.2 `bscflib/tags.py`
 
@@ -278,11 +296,17 @@ single resolver in `resolve.py`. A rung uses a two-operator syntax:
 - `SWEEP_LIABILITY_PATTERNS` is borrowings vocabulary only. Deferred credits,
   accruals and other long-term liabilities are out of the formula *by design*
   rather than missed, and sweeping them would flag every company with a pension.
-- `SWEEP_EXCLUDE_PATTERNS` carries a long tail of disclosure-note artifacts
-  (maturity ladders, unrealized gain/loss tables, cost-basis alternates) that
-  would otherwise multiply the same pool several times over. It also excludes
-  REIT/BDC operating assets — for a property trust, "investment" is the
-  business, not a liquid balance.
+- **`SWEEP_EXCLUDE_PATTERNS` is assembled from four named groups** —
+  `_DISCLOSURE_ARTIFACTS`, `_NOT_IN_FORMULA`, `_OPERATING_INVESTMENTS`,
+  `_NOT_A_BALANCE` — so a change can target one reason without re-reading all
+  forty entries. The groups were always in the comments; they are now in the
+  data.
+- Matching is by substring, so **an entry containing another entry is dead
+  weight.** `"unrealized"` (subsumed by `"realized"`) and
+  `"fairvaluedisclosure"` (subsumed by `"fairvalue"`) were dropped for that
+  reason and could never have fired.
+- `_OPERATING_INVESTMENTS` excludes REIT/BDC operating assets — for a property
+  trust, "investment" is the business, not a liquid balance.
 
 ### 4.3 `bscflib/resolve.py`
 
@@ -294,13 +318,19 @@ the right taxonomy for a foreign filer, and one currency throughout.
 | function / type | role |
 |---|---|
 | `Fact` | one observation: `end`, `val`, `filed` |
-| `Resolution` | `value`, `tags`, `notes`, `stale` |
+| `Resolution` | frozen: `value`, `tags`, `notes`, `stale` |
+| `Resolution.resolved` | did a tag supply this figure **at the target date** |
+| `Resolution.with_note` / `.less` | a new Resolution, annotated / netted down |
+| `Basis` | `namespace`, `unit`, `as_of`, `filed`, `index` |
+| `Index` | `tag -> {date: Fact}` |
 | `parse_date(value)` | `"YYYY-MM-DD"` -> `date` |
-| `index_instants(facts, namespace, unit)` | `tag -> {date: Fact}`, latest filing wins |
-| `parse_rung(rung)` | the two-operator rung syntax -> slots |
-| `resolve_instant(index, namespace, field, as_of)` | walk one ladder at one date |
+| `_instants(facts, ns, tag, unit=None)` | every instant observation for one tag |
+| `index_instants(facts, namespace, unit)` | build an `Index`, latest filing wins |
+| `parse_rung(rung)` | the two-operator rung syntax -> slots (cached) |
+| `_ladder_tags(ladder)` | every tag a ladder names, in order |
+| `resolve_instant(index, ns, field, as_of)` | walk one ladder at one date |
 | `anchor_dates(index, namespace)` | every balance sheet date published, oldest first |
-| `choose_basis(facts)` | `(namespace, unit, as_of, filed)` |
+| `choose_basis(facts)` | `Basis`, or `None` |
 | `sweep_unclassified(...)` | balances in a category no ladder captured, largest first |
 
 *Worth knowing.*
@@ -310,10 +340,23 @@ the right taxonomy for a foreign filer, and one currency throughout.
 - **Namespace is chosen by which taxonomy reports the newest balance sheet**,
   never by which one happens to exist. A foreign private issuer's `us-gaap`
   facts are often frozen years before its live `ifrs-full` ones.
+- **`_instants` is the one payload shape the module walks.** Namespace
+  selection, unit selection, the filed-date lookup and the sweep each used to
+  spell out their own four-level nested loop over it.
+- **`choose_basis` returns the index it built.** It has to construct one per
+  candidate unit to score them; `analyze` used to throw the winner away and
+  rebuild the same multi-megabyte walk immediately afterwards.
 - `resolve_instant` only counts facts at exactly `as_of`. If nothing resolves
   there, it reports the newest *older* value as `stale`, so a figure the filer
   did publish is visibly excluded rather than silently read as absent —
-  invariant §1.3 rule 3.
+  invariant §1.3 rule 3. **`Resolution.resolved` is the predicate for this**;
+  it replaced `line and line.tags` spelled out at seven call sites.
+- **`Resolution` is frozen.** The combined-debt netting used to edit it in
+  place from `formula.py`, so nothing in `resolve.py` told you `value` was not
+  final. `.less()` returns a new one, clamped at nil and saying so.
+- `parse_rung` is cached — the ladders are static module data, and it was
+  re-splitting the same strings for every field, at every date in the trend
+  window, on both passes of every lookup.
 - The bracket notes in the output originate here: `sum of N separately reported
   components` when a rung sums, and `caption bundles finance leases with
   borrowings` when a tag contains `CapitalLease`.
@@ -325,10 +368,17 @@ the right taxonomy for a foreign filer, and one currency throughout.
 
 *Role.* The BSCF formula, and the checks that say whether to believe it.
 
-| function | role |
+| function / type | role |
 |---|---|
-| `snapshot(index, namespace, as_of)` | the whole formula at one balance sheet date |
-| `analyze(ticker, cik, refresh)` | `(result, reason)` — the full record, or why not |
+| `Result` | **the record every renderer reads** — frozen, flat, 24 fields |
+| `Snapshot` | the formula at one date |
+| `SweepBasis` | what the sweep must not count again (`counted`, `used`) |
+| `Reason` | `text`, `out_of_scope` — why a ticker produced no result |
+| `snapshot(index, namespace, as_of)` | `(Snapshot, SweepBasis)`, or `None` |
+| `_net_combined_debt(noncurrent, current)` | the combined-caption netting |
+| `_overlaps(lines)` | debt lines exceeding their own subtotal |
+| `_sweep(facts, basis, scaffold, gaps)` | both sides of the sweep |
+| `analyze(ticker, cik, refresh)` | `(Result, None)` or `(None, Reason)` |
 
 *Constants.*
 
@@ -339,13 +389,19 @@ the right taxonomy for a foreign filer, and one currency throughout.
 | `DOUBT_VS_SIGNAL_MAX` | `1.0` |
 | `DOUBT_ABSOLUTE_MAX` | `0.25` |
 | `ASSET_GAP_FIELDS` / `LIABILITY_GAP_FIELDS` | which gaps arm which side of the sweep |
-| `OUT_OF_SCOPE` / `DOUBTFUL` | skip-reason prefixes, read by `print_skipped` |
 
 *Worth knowing.*
+- **`Result` is the contract.** It used to be a bare `dict` assembled by
+  splatting `snapshot`'s return and adding twelve more keys, with its shape
+  written down nowhere. `report.py` reads it by attribute, so a rename fails
+  loudly instead of producing a blank CSV column.
+- **`SweepBasis` is not part of a `Result`.** `counted` and `used` are
+  scaffolding the sweep needs; they used to ride into every result and on into
+  the renderers, which never read them.
 - **Combined-caption netting.** When the non-current debt line comes from a
   `COMBINED_DEBT_TAGS` caption, the separately reported current portion is
   subtracted so the two debt lines cannot describe the same dollars. Netting
-  below zero is clamped to nil and says so.
+  below zero is clamped to nil and says so. Lives in `_net_combined_debt`.
 - **The sweep only runs for a side that actually has a gap.** Without that it
   fires on companies whose components all resolved, where any hit is an
   overlapping disclosure restatement rather than a miss.
@@ -370,21 +426,20 @@ separate from `sec_client` because it is a different service with different
 manners: a browser User-Agent and an `Origin` header, uncached, and free to stop
 answering without that being a SEC problem.
 
+**This module is the read path only.** The archive that preserves these rows is
+§4.6; the two share `fetch_raw` and nothing else.
+
 | function / type | role |
 |---|---|
 | `Row` | `symbol`, `market_cap`, `market_cap_raw`, `timing` |
-| `Capture` | `dates`, `rows`, `timed`, `failures` |
 | `parse_market_cap(raw)` | `(value, unrecognised_text)` |
 | `parse_timing(raw)` | `"pre-market"` / `"after-hours"` / `""` |
+| `normalise_symbol(raw)` | the row's ticker, or `""` |
+| `fetch_raw(day)` | raw Nasdaq rows, verbatim |
 | `fetch(day)` | every company reporting on `day` |
-| `capture(directory, start, days)` | archive the raw rows for a forward window |
-| `capture_path(directory, day)` | `calendar/<date>.json` |
-| `_get(day)` | raw Nasdaq rows, verbatim |
-| `_merge(record, rows, observed)` | fold one observation into a day's archive |
 
 *Constants.* `CALENDAR_URL`, `TIMEOUT = 20`, `BROWSER_USER_AGENT`,
-`MARKET_CAP_PATTERN`, `TIMING`, `CAPTURE_WINDOW_DAYS = 14`,
-`CAPTURE_INTERVAL = 0.3`.
+`MARKET_CAP_PATTERN`, `TIMING`, `NOT_SUPPLIED`.
 
 *Worth knowing.*
 - **`parse_market_cap` is a tripwire, not a parser.** It distinguishes three
@@ -395,40 +450,110 @@ answering without that being a SEC problem.
   misread, invisible in the output *and* in the `Skipped` report. No unit
   interpretation is attempted — a `B`/`M` suffix handler would be guessing at a
   schema change nobody has observed. Evidence in §5.3.
-- **The unrecognized-format warning is silent while the format holds.** The
-  first run that prints it is the run where Nasdaq changed something, which for
-  an undocumented endpoint is the only warning there will be.
-- `symbol` is load-bearing and read with `raw["symbol"]`; `marketCap` is
-  advisory and read with `.get`. A row without a symbol is skipped.
+- **`MARKET_CAP_PATTERN` requires a leading digit**, which makes the pattern the
+  single thing deciding whether a string is a figure — the parse below it needs
+  no guards of its own. It also means comma-leading junk (`"$,,5"`) trips the
+  wire instead of quietly parsing as `5`.
+- The unrecognized-format warning is rendered by `report.calendar_warning` and
+  **is silent while the format holds.** The first run that prints it is the run
+  where Nasdaq changed something, which for an undocumented endpoint is the only
+  warning there will be.
+- `symbol` is load-bearing; `marketCap` is advisory. `normalise_symbol` treats a
+  whitespace-only symbol as absent, which `fetch` previously let through as a
+  `Row` with an empty ticker.
 - Ticker separator reconciliation (`BRK.B` vs `BRK-B`) is **not** done here — it
   belongs to SEC's ticker file and lives in `sec_client.lookup_cik`.
-- `capture` never raises. An incomplete archive is a cost; a run that dies
-  before it reaches SEC is a bigger one. Merge rules in §5.4.
 
-### 4.6 `bscflib/report.py` — terminal
+### 4.6 `bscflib/calendar_archive.py`
+
+*Role.* The calendar archive — the one thing this tool writes that it cannot
+re-read. Split from `earnings_calendar` because it is the opposite kind of job:
+that module reads a list for the screen and forgets it, this one owns durable
+files with their own atomicity, merge and never-overwrite rules.
+
+| function / type | role |
+|---|---|
+| `Capture` | `dates`, `rows`, `timed`, `failures` |
+| `capture_path(directory, day)` | `calendar/<date>.json` |
+| `_merge(record, rows, observed)` | fold one observation into a day's archive |
+| `_archive_day(path, day, rows, observed)` | read, merge and write one day |
+| `capture(directory, start, days)` | archive the raw rows for a forward window |
+
+*Constants.* `CAPTURE_WINDOW_DAYS = 14`, `CAPTURE_INTERVAL = 0.3`.
+
+*Worth knowing.*
+- **`capture` never raises, for any reason** — including an unusable directory.
+  An incomplete archive is a cost; a run that dies before it reaches SEC is a
+  bigger one. Callers do not need a guard, and `bscf.py` no longer has one.
+- **It catches transport errors and malformed JSON only.** A payload *shape*
+  change raises out of it on purpose: this module's premise is that a silent
+  change to the feed is the failure worth stopping for, so folding one into a
+  failure tally would contradict the tripwire in §4.5.
+- **`_merge` returns what the archive now holds**, not what the fetch happened
+  to see. The two differ exactly when Nasdaq retracts a slot it already gave —
+  which is the case the never-overwrite rule exists for, so the counter now
+  reflects the protection instead of hiding it.
+- A confirmed slot is never overwritten by a later "not supplied"; a *different*
+  confirmed slot does replace it, and every change is appended to
+  `timing_history` with the time it was seen.
+- Writes go through `jsonio.write_json_atomic` (§4.11). A file that will not
+  parse is **left alone**, counted as a failure, never overwritten.
+- Merge rules in full: §5.4.
+
+### 4.7 `bscflib/report.py` — terminal
 
 *Role.* The printed breakdown, the tables and the CSV.
 
-| function | role |
+| function / type | role |
 |---|---|
 | `money(value, unit)` | `$1,234,567`, or `TWD 1,234,567` for non-USD filers |
 | `millions(value)` | scaled column for the wide screen table |
 | `ratio(value, places=3)` | the normalized result |
+| `calendar_warning(rows)` | the unrecognized-market-cap tripwire, as lines |
 | `flags(result)` | builds the `*` `~` `!` suffix on a ticker |
+| `_header` / `_ledger` / `_totals` | the three parts of a breakdown body |
+| `_excluded` / `_sweep` / `_overlap` | the caveat sections |
 | `render(result, column)` | the per-company breakdown block |
 | `column_width(results)` | shared money-column width across a run |
-| `_table(headers, rows, align)` | generic fixed-width table builder |
+| `Column` | one table column: `header`, `align`, `value` |
+| `_table(columns, results)` | generic fixed-width table builder |
 | `summary(results)` | compact table, detail mode |
 | `screen(results, target)` | wide table, screen mode |
 | `legend(results)` / `trend(...)` | footers |
 | `write_csv(results, path)` | full record incl. things the tables omit |
 
-*Constants.* `WIDTH = 78`, `MILLIONS`, `STALE_AFTER_DAYS = 180`.
+*Constants.* `WIDTH = 78`, `MILLIONS`, `STALE_AFTER_DAYS = 180`, `LABELS`,
+`EXCLUDED_LINES`, `SECTIONS`, `SUMMARY_COLUMNS`, `SCREEN_COLUMNS`,
+`CSV_PLAIN` / `CSV_DERIVED` / `CSV_COLUMNS`.
 
-### 4.7 `bscflib/html_report.py` — a self-contained page
+*Worth knowing.*
+- **`render` is a list of sections**, each returning its own lines or nothing.
+  A section with nothing to say emits no rule either.
+- **A `Column` carries its header, its alignment and how to read its value.**
+  These used to be a header list and a positional alignment string
+  (`"<<<>>>>><<"`) that had to be counted against each other by hand; a miscount
+  gave an `IndexError` or a silent misalignment.
+- `_table` renders an empty row set as headers plus rules. It used to raise
+  `TypeError` on one — unreachable from the two callers, but it is billed as
+  generic.
+- **Screen mode ranks a missing `norm` last via the sort key**
+  (`(r.norm is None, -(r.norm or 0.0))`), not via a `-9e9` sentinel standing in
+  for one.
+- **The CSV schema is declared, not derived from `Result`'s field order.**
+  Stage 2 reads that file, so an unrelated edit to `Result` must not silently
+  reorder or add a column. What the declaration buys is that every value is read
+  by name off the dataclass — a renamed field raises instead of writing a blank
+  cell. `_check_csv_schema()` runs at import and fails if the two have drifted.
+
+### 4.8 `bscflib/html_report.py` — a self-contained page
 
 *Role.* One `.html` file with the CSS and JS inlined. No build step, no server,
 no CDN, no network at open time — it works from `file://`. Vanilla everything.
+
+> **Not on the `logic` branch.** This module lives on `display`. The entry below
+> describes it as built there; it has **not** been migrated to `formula.Result`
+> or to the `report.py` surface documented in §4.7, and will need both when the
+> branches meet.
 
 | function | role |
 |---|---|
@@ -458,7 +583,9 @@ the thresholds it was drawn with.
   multi-company view grows from — no rewrite needed.
 - `money`, `ratio`, `flags`, `LABELS` and `STALE_AFTER_DAYS` are imported from
   `report.py` rather than reimplemented, so the terminal and the page cannot
-  drift apart on what a number looks like.
+  drift apart on what a number looks like. **`flags` now takes a `Result`, and
+  the section helpers in `report.py` have the same names as the ones here** —
+  the merge should reconcile the two, not duplicate them.
 - How the §1.3 formatting rules survive the medium:
   1. the tag is printed under each figure, not hidden behind a hover — a
      screenshot has to stay diagnosable
@@ -472,7 +599,7 @@ the thresholds it was drawn with.
   5. flags ride the ticker and carry their meaning next to them, with the legend
      kept at the foot as a reminder rather than a lookup
 
-### 4.8 `bscflib/sec_client.py`
+### 4.9 `bscflib/sec_client.py`
 
 *Role.* Talking to SEC EDGAR: rate limiting, retries, and the ticker -> CIK map.
 
@@ -493,12 +620,20 @@ the thresholds it was drawn with.
   User-Agent here is an **honest identification** — the opposite posture from
   `earnings_calendar`'s browser disguise, which is why the two clients are
   separate modules.
+- **404 is the only status that returns `None`**, because it is the only one
+  meaning "this filer has nothing published". Every other outcome raises.
+  `raise_for_status` fires only on 4xx/5xx, so a 3xx or a non-200 2xx used to
+  fall out of the retry loop as `None` and reach the user as *"no XBRL company
+  facts published"* — a claim about the company derived from a transport
+  oddity, which is what §1.3 rule 6 forbids.
 - `SEC_REQUEST_INTERVAL = 0.12` sits under EDGAR's published 10 requests/second
   ceiling. Retries back off as `2**attempt`.
 - `lookup_cik` tries `ticker`, then `.`→`-`, then `/`→`-`, because Nasdaq writes
   `BRK.B` or `BRK/B` where SEC's file writes `BRK-B`.
+- `_last_call` is module-level mutable state — the only hidden state in the
+  project. Fine for a single-threaded CLI; worth knowing it is there.
 
-### 4.9 `bscflib/sec_cache.py`
+### 4.10 `bscflib/sec_cache.py`
 
 *Role.* On-disk cache for SEC responses.
 
@@ -506,7 +641,7 @@ the thresholds it was drawn with.
 |---|---|
 | `cache_path(url)` | SHA1-derived filename inside `CACHE_DIR` |
 | `load(url, refresh)` | cached payload, or `None` |
-| `store(url, payload)` | write one payload |
+| `store(url, payload)` | write one payload, atomically |
 
 *Constants.* `PROJECT_ROOT`, `CACHE_DIR = "<root>/SEC cache"`,
 `CACHE_TTL_HOURS = 24`.
@@ -517,8 +652,26 @@ the thresholds it was drawn with.
 - **Staleness costs almost nothing here:** a company reporting today has not
   filed its new 10-Q yet, so the figures being screened are last quarter's
   either way.
+- `store` writes through `jsonio.write_json_atomic` (§4.11). A corrupt cache
+  file self-heals into a re-fetch, so it does not strictly need atomicity — but
+  two writers with two disciplines is how the careful one gets edited into the
+  careless one.
 - Renaming the folder is fine, but `CACHE_DIR` has to follow it in the same
   change — see §3.2.
+
+### 4.11 `bscflib/jsonio.py`
+
+*Role.* One atomic JSON write, shared by both on-disk writers.
+
+| function | role |
+|---|---|
+| `write_json_atomic(path, payload, **dump_kwargs)` | write via a temp file, then `os.replace` |
+
+*Worth knowing.*
+- The calendar archive needs this because its files cannot be re-fetched at any
+  price. The SEC cache uses it so the project has one discipline rather than
+  two.
+- Creates the parent directory if it is missing.
 
 ---
 
@@ -617,7 +770,7 @@ the history and conflict on every branch — but it means the only copy is the
 working directory. Back `calendar/` up somewhere outside the repository.
 
 The archive runs on **every** `--date` run, over a forward window of today
-through today+14 (`CAPTURE_WINDOW_DAYS`), regardless of which date is being
+through today+14 (`calendar_archive.CAPTURE_WINDOW_DAYS`), regardless of which date is being
 screened — what it preserves is a property of *now*, not of the target. Each
 upcoming day is therefore observed on every run between now and the day it
 happens, so a slot confirmed after the last screen is still recorded.
@@ -757,7 +910,7 @@ current/non-current debt.
 ### 6.4 CSV and HTML
 
 `write_csv` carries the **full record**, including fields the terminal tables
-omit. HTML is one self-contained page per run, one card per company — see §4.7.
+omit. HTML is one self-contained page per run, one card per company — see §4.8.
 
 ---
 
@@ -785,10 +938,15 @@ instead of running off the end.
 don't line up with each other.
 
 ### Dangling separator
-*Status:* open in terminal · resolved in HTML (verified on MSFT and TSM).
-A company with no excluded lines and no sweep hits ends its block on a trailing
-`---` rule with nothing under it. In HTML, sections are elements that either
-exist or don't, so there is no rule to leave hanging.
+*Status:* **not reproducible — entry kept as a record.**
+The claim was that a company with no excluded lines and no sweep hits ends its
+block on a trailing `---` rule with nothing under it. Checked Sep 2026 against
+MSFT, AAPL, NVDA, TSM, ARCC and KO, covering every combination of excluded /
+sweep / overlap present or absent: no block ends on a rule. `render()` only
+ever emits a rule as the *opening* of a section that goes on to emit content,
+so there is nothing to leave hanging. It is now structurally impossible as
+well: `render()` is a list of section functions (§4.7) and a section with
+nothing to say returns no lines at all, rule included.
 
 ### Non-USD money columns aren't comparable across rows
 *Status:* open in terminal · unchanged in HTML, deliberately.
@@ -824,10 +982,10 @@ Read that before rebuilding any of it from scratch.
 
 `calendar/` records before-open/after-close for every upcoming date, and
 `earnings_calendar.Row` carries it as `timing`, but **nothing downstream reads
-it** — it is not in the result dicts, the screen table, the CSV or the HTML.
+it** — it is not on `formula.Result`, the screen table, the CSV or the HTML.
 That is deliberate. Stage 2 needs it (pre-market volume, VWAP anchored to the
 open, pre/post-gap RSI resets), but its requirements are not concrete yet, and
-threading one field through `collect()`, `write_csv` and the table formats would
+threading one field through `Result`, `write_csv` and the table formats would
 fix a schema before there is anything to fix it against. The data is perishable
 and the schema is not, so the perishable half was done now and the schema half
 left until Stage 2 can specify it. The archive keeps every field, so that

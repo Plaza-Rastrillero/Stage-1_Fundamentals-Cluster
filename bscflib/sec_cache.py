@@ -19,6 +19,8 @@ import json
 import os
 import time
 
+from .jsonio import write_json_atomic
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(PROJECT_ROOT, "SEC cache")
 CACHE_TTL_HOURS = 24
@@ -45,6 +47,4 @@ def load(url: str, refresh: bool = False) -> dict | None:
 
 
 def store(url: str, payload: dict) -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(cache_path(url), "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
+    write_json_atomic(cache_path(url), payload)

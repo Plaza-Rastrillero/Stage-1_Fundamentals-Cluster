@@ -20,8 +20,10 @@ Folder layout:
                      formula.py  net assets, total debt, doubt gate, trend
                      resolve.py  tags -> numbers
                      report.py   the printed breakdown, tables and CSV
-                     sec_client.py / sec_cache.py / earnings_calendar.py
+                     sec_client.py / sec_cache.py / jsonio.py
                                  fetching and caching
+                     earnings_calendar.py / calendar_archive.py
+                                 the Nasdaq calendar, and its archive
     output/        the CSVs a --date run writes
     calendar/      raw Nasdaq calendar rows, archived by every --date run.
                    NOT safe to delete: Nasdaq drops the before-open/after-close
@@ -43,9 +45,16 @@ sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
 import os  # noqa: E402
-from datetime import datetime  # noqa: E402
+from datetime import date, datetime  # noqa: E402
+from typing import NamedTuple  # noqa: E402
 
-from bscflib import earnings_calendar, formula, report, sec_client  # noqa: E402
+from bscflib import (  # noqa: E402
+    calendar_archive,
+    earnings_calendar,
+    formula,
+    report,
+    sec_client,
+)
 
 MIN_MARKET_CAP = 300_000_000
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -55,59 +64,121 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 CALENDAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar")
 
 
+class Skip(NamedTuple):
+    """One ticker that produced no result, and why."""
+
+    ticker: str
+    reason: formula.Reason
+
+
 def collect(
     tickers: list[str], refresh: bool, verbose: bool
-) -> tuple[list[dict], list[tuple[str, str]]]:
+) -> tuple[list[formula.Result], list[Skip]]:
     cik_map = sec_client.fetch_ticker_cik_map(refresh)
-    results: list[dict] = []
-    skipped: list[tuple[str, str]] = []
+    results: list[formula.Result] = []
+    skipped: list[Skip] = []
     seen: dict[int, str] = {}
 
     for position, ticker in enumerate(tickers, start=1):
         prefix = f"[{position}/{len(tickers)}] {ticker}"
         cik = sec_client.lookup_cik(ticker, cik_map)
         if cik is None:
-            skipped.append((ticker, "not a SEC filer in company_tickers.json"))
+            skipped.append(Skip(ticker, formula.Reason(
+                "not a SEC filer in company_tickers.json")))
             continue
         # Share classes (DGICA/DGICB) are one filer with one balance sheet, so a
         # second ticker would put the same company in the ranking twice.
         if cik in seen:
-            skipped.append((ticker, f"{formula.OUT_OF_SCOPE}share class of {seen[cik]}"))
+            skipped.append(Skip(ticker, formula.Reason(
+                f"share class of {seen[cik]}", out_of_scope=True)))
             continue
         seen[cik] = ticker
         try:
             result, reason = formula.analyze(ticker, cik, refresh)
         except Exception as exc:  # noqa: BLE001 - one bad ticker shouldn't end the run
-            skipped.append((ticker, f"{type(exc).__name__}: {exc}"))
+            skipped.append(Skip(ticker, formula.Reason(f"{type(exc).__name__}: {exc}")))
             print(f"{prefix}: skipped - {type(exc).__name__}: {exc}", flush=True)
             continue
         if result is None:
-            skipped.append((ticker, reason))
+            skipped.append(Skip(ticker, reason))
             if verbose:
-                print(f"{prefix}: skipped - {reason}", flush=True)
+                print(f"{prefix}: skipped - {reason.text}", flush=True)
             continue
         results.append(result)
         if verbose:
-            print(f"{prefix}: {report.ratio(result['norm'])} as of {result['as_of']}",
+            print(f"{prefix}: {report.ratio(result.norm)} as of {result.as_of}",
                   flush=True)
     return results, skipped
 
 
-def print_skipped(skipped: list[tuple[str, str]]) -> None:
-    out_of_scope = [(t, r) for t, r in skipped if r.startswith(formula.OUT_OF_SCOPE)]
-    problems = [(t, r) for t, r in skipped if not r.startswith(formula.OUT_OF_SCOPE)]
+def print_skipped(skipped: list[Skip]) -> None:
+    by_design = [s for s in skipped if s.reason.out_of_scope]
+    problems = [s for s in skipped if not s.reason.out_of_scope]
     print(f"\n=== Skipped ({len(skipped)}) ===")
-    if out_of_scope:
-        print(f"\n  Outside coverage by design ({len(out_of_scope)}):")
-        for ticker, reason in out_of_scope:
-            print(f"    {ticker}: {reason[len(formula.OUT_OF_SCOPE):]}")
-    if problems:
-        print(f"\n  Data problems worth a look ({len(problems)}):")
-        for ticker, reason in problems:
-            print(f"    {ticker}: {reason}")
+    for heading, group in (("Outside coverage by design", by_design),
+                           ("Data problems worth a look", problems)):
+        if not group:
+            continue
+        print(f"\n  {heading} ({len(group)}):")
+        for skip in group:
+            print(f"    {skip.ticker}: {skip.reason.text}")
 
 
-def main() -> int:
+def calendar_tickers(target: date, min_cap: float) -> list[str]:
+    """The tickers reporting on `target`, filtered by market cap."""
+    print(f"Fetching Nasdaq earnings calendar for {target}...")
+    rows = earnings_calendar.fetch(target)
+    print(f"  {len(rows)} ticker(s) reporting.")
+    for note in report.calendar_warning(rows):
+        print(note)
+    if min_cap <= 0:
+        return [r.symbol for r in rows]
+    # Unknown cap is kept: missing calendar metadata is not evidence of a small
+    # company, and the SEC data will speak for itself.
+    kept = [r.symbol for r in rows
+            if r.market_cap is None or r.market_cap >= min_cap]
+    print(f"  {len(rows) - len(kept)} below "
+          f"${min_cap / report.MILLIONS:,.0f}M market cap, "
+          f"{len(kept)} remain.")
+    return kept
+
+
+def archive_calendar() -> None:
+    """Preserve the perishable half of the calendar.
+
+    Runs whatever date is under screen, because what it preserves is a property
+    of now rather than of the target: Nasdaq wipes the before-open/after-close
+    field once a date has passed, so a day not recorded before it happens cannot
+    be recovered. `capture` never raises, so there is nothing to guard here.
+    """
+    captured = calendar_archive.capture(CALENDAR_DIR)
+    print(f"  Archived {captured.rows} calendar row(s) over "
+          f"{captured.dates} upcoming date(s); {captured.timed} carry a "
+          f"confirmed before-open/after-close slot.")
+    if captured.failures:
+        print(f"  {captured.failures} date(s) could not be archived.")
+
+
+def render(results: list[formula.Result], target: date | None) -> None:
+    """Whichever of the two output shapes this run calls for."""
+    if not results:
+        print("\nNo ticker produced a complete set of figures.")
+    elif target is None:
+        column = report.column_width(results)
+        for result in results:
+            print("\n".join(report.render(result, column)))
+            print()
+        print("\n".join(report.summary(results)))
+    else:
+        print("\n".join(report.screen(results, target)))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        path = os.path.join(OUTPUT_DIR, f"bscf_{target.isoformat()}_{stamp}.csv")
+        report.write_csv(results, path)
+        print(f"\nWrote {path}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -122,6 +193,11 @@ def main() -> int:
                         help="ignore cached SEC data and re-fetch")
     parser.add_argument("--drop-doubtful", action="store_true",
                         help="exclude rows whose unclassified pool outweighs the signal")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if not sec_client.SEC_USER_AGENT:
@@ -141,44 +217,8 @@ def main() -> int:
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers]
     else:
-        print(f"Fetching Nasdaq earnings calendar for {target}...")
-        rows = earnings_calendar.fetch(target)
-        print(f"  {len(rows)} ticker(s) reporting.")
-        # Silent while the format holds. The first run that prints this is the
-        # run where Nasdaq changed something under us, which is the only
-        # warning this endpoint will ever give.
-        unrecognised = [r for r in rows if r.market_cap_raw is not None]
-        if unrecognised:
-            sample = ", ".join(f'{r.symbol} "{r.market_cap_raw}"'
-                               for r in unrecognised[:3])
-            print(f"  WARNING: {len(unrecognised)} market cap value(s) in an "
-                  f"unrecognised format ({sample}).")
-            print("           Treated as unknown and kept - --min-cap did not "
-                  "filter them.")
-        if args.min_cap > 0:
-            # Unknown cap is kept: missing calendar metadata is not evidence of
-            # a small company, and the SEC data will speak for itself.
-            tickers = [r.symbol for r in rows
-                       if r.market_cap is None or r.market_cap >= args.min_cap]
-            print(f"  {len(rows) - len(tickers)} below "
-                  f"${args.min_cap / report.MILLIONS:,.0f}M market cap, "
-                  f"{len(tickers)} remain.")
-        else:
-            tickers = [r.symbol for r in rows]
-        # Runs whatever date is under screen, because what it preserves is a
-        # property of now rather than of the target: Nasdaq wipes the
-        # before-open/after-close field once a date has passed, so a day not
-        # recorded before it happens cannot be recovered.
-        try:
-            captured = earnings_calendar.capture(CALENDAR_DIR)
-        except Exception as exc:  # noqa: BLE001 - the archive is never the point
-            print(f"  Calendar archive skipped - {type(exc).__name__}: {exc}")
-        else:
-            print(f"  Archived {captured.rows} calendar row(s) over "
-                  f"{captured.dates} upcoming date(s); {captured.timed} carry a "
-                  f"confirmed before-open/after-close slot.")
-            if captured.failures:
-                print(f"  {captured.failures} date(s) could not be archived.")
+        tickers = calendar_tickers(target, args.min_cap)
+        archive_calendar()
     if args.limit:
         tickers = tickers[: args.limit]
     if not tickers:
@@ -190,29 +230,14 @@ def main() -> int:
     results, skipped = collect(tickers, args.refresh, verbose=target is not None)
 
     if args.drop_doubtful:
-        kept = [r for r in results if not r["doubtful"]]
-        for r in results:
-            if r["doubtful"]:
-                skipped.append((r["ticker"], f"{formula.DOUBTFUL}doubt {r['doubt']:.1%} "
-                                             f"vs norm {report.ratio(r['norm'])}"))
-        results = kept
+        skipped.extend(
+            Skip(r.ticker, formula.Reason(
+                f"doubtful data: doubt {r.doubt:.1%} vs norm {report.ratio(r.norm)}"))
+            for r in results if r.doubtful
+        )
+        results = [r for r in results if not r.doubtful]
 
-    if not results:
-        print("\nNo ticker produced a complete set of figures.")
-    elif target is None:
-        column = report.column_width(results)
-        for result in results:
-            print("\n".join(report.render(result, column)))
-            print()
-        print("\n".join(report.summary(results)))
-    else:
-        print("\n".join(report.screen(results, target)))
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        path = os.path.join(OUTPUT_DIR, f"bscf_{target.isoformat()}_{stamp}.csv")
-        report.write_csv(results, path)
-        print(f"\nWrote {path}")
-
+    render(results, target)
     if skipped:
         print_skipped(skipped)
     return 0

@@ -28,7 +28,14 @@ _last_call = 0.0
 
 
 def sec_get(url: str) -> dict | None:
-    """GET a SEC endpoint, rate-limited and retried. None on a clean 404."""
+    """GET a SEC endpoint, rate-limited and retried. None on a clean 404.
+
+    404 is the *only* status that returns None, because it is the only one that
+    means "this filer has nothing published". Every other outcome raises.
+    Returning None for, say, a redirect or a 204 would surface to the user as
+    "no XBRL company facts published" - a claim about the company derived from
+    a transport oddity, which is exactly what CONTEXT.md 1.3 rule 6 forbids.
+    """
     global _last_call
     headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
     for attempt in range(SEC_MAX_RETRIES):
@@ -42,9 +49,12 @@ def sec_get(url: str) -> dict | None:
         if response.status_code == 200:
             return response.json()
         if attempt == SEC_MAX_RETRIES - 1:
+            # raise_for_status only raises on 4xx/5xx; a 3xx or a 2xx that is
+            # not 200 would otherwise fall out of the loop silently.
             response.raise_for_status()
+            raise RuntimeError(f"SEC returned HTTP {response.status_code} for {url}")
         time.sleep(2**attempt)
-    return None
+    raise RuntimeError(f"SEC request exhausted {SEC_MAX_RETRIES} retries: {url}")
 
 
 def cached_sec_get(url: str, refresh: bool = False) -> dict | None:
